@@ -16,6 +16,10 @@ Built for **visibility, control, and straightforward network reconnaissance**.
 * Contact: [xploitoverload@github.com](mailto:hello@cx330.in)
 ---
 
+<p align="center">
+  <img src="demo.gif" alt="NetRecon Demo">
+</p>
+
 ## Why This Exists
 
 NetRecon was built to provide a simple and practical way to discover and monitor devices on a local network.
