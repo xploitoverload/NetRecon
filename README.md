@@ -1,6 +1,6 @@
 > "Every network tells a story. NetRecon helps you read it."
 
-## NetRecon: Local Network Reconnaissance
+## NetReconX: Local Network Reconnaissance
 
 **NetRecon** is a Python-based network reconnaissance tool built from scratch for discovering and monitoring devices on local networks.
 
