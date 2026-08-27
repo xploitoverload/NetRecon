@@ -2,7 +2,7 @@
 
 ## NetReconX: Local Network Reconnaissance
 
-**NetRecon** is a Python-based network reconnaissance tool built from scratch for discovering and monitoring devices on local networks.
+**NetReconX** is a Python-based network reconnaissance tool built from scratch for discovering and monitoring devices on local networks.
 
 It provides active ARP scanning, passive ARP sniffing, an interactive terminal interface, live host monitoring, TCP port scanning, MAC vendor lookup, known-host labeling, and JSON/CSV export.
 
