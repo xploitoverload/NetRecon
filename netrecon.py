@@ -11,8 +11,7 @@ Active/passive scanning, interactive TUI, parsable output,
 live monitor, port scan, JSON/CSV export.
 
 Developer  : Kalpesh Solanki (xploitoverload)
-Inspired by: netdiscover by Jaime Penalba <jpenalbae@gmail.com>
-             https://github.com/netdiscover-scanner/netdiscover
+
 """
 
 import sys
