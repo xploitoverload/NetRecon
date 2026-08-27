@@ -14,6 +14,7 @@ Built for **visibility, control, and straightforward network reconnaissance**.
 
 * **Kalpesh Solanki**
 * Contact: [hello@cx330.in](mailto:hello@cx330.in)
+
 ---
 
 <p align="center">
@@ -37,27 +38,50 @@ NetRecon was built to provide a simple and practical way to discover and monitor
 * libpcap
 * Root privileges for active scanning
 
-### Install dependencies
+### Install from PyPI
+
+The easiest way to install NetRecon is through PyPI:
 
 ```bash
-sudo apt update
-sudo apt install python3-pip python3-venv libpcap-dev tcpdump
+python3 -m pip install netreconx
 ```
 
-### Setup
+Verify the installation:
+
+```bash
+netreconx --help
+```
+
+For active network scanning, run it with elevated privileges:
+
+```bash
+sudo netreconx -i wlan0 -r 192.168.0.0/24
+```
+
+### Install from Source
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/xploitoverload/NetRecon.git
 cd NetRecon
+```
 
+Create and activate a virtual environment:
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
+```
 
+Install dependencies:
+
+```bash
 python -m pip install --upgrade pip
 python -m pip install scapy netifaces rich
 ```
 
-### Verify
+Verify dependencies:
 
 ```bash
 python -c "import scapy, netifaces, rich; print('Dependencies OK')"
@@ -67,58 +91,58 @@ python -c "import scapy, netifaces, rich; print('Dependencies OK')"
 
 ## Usage
 
-### Basic scan
+### Basic Scan
 
 ```bash
-sudo python3 netrecon.py
+sudo netreconx
 ```
 
-### Scan a specific network
+### Scan a Specific Network
 
 ```bash
-sudo python3 netrecon.py -i wlan0 -r 192.168.0.0/24
+sudo netreconx -i wlan0 -r 192.168.0.0/24
 ```
 
-### Passive mode
+### Passive Mode
 
 ```bash
-sudo python3 netrecon.py -i wlan0 -p
+sudo netreconx -i wlan0 -p
 ```
 
-### Fast scan
+### Fast Scan
 
 ```bash
-sudo python3 netrecon.py -i wlan0 -r 192.168.0.0/24 -f
+sudo netreconx -i wlan0 -r 192.168.0.0/24 -f
 ```
 
-### Live monitoring
+### Live Monitoring
 
 ```bash
-sudo python3 netrecon.py --live --interval 10
+sudo netreconx --live --interval 10
 ```
 
-### TCP port scanning
+### TCP Port Scanning
 
 ```bash
-sudo python3 netrecon.py -i wlan0 -r 192.168.0.0/24 --ports
+sudo netreconx -i wlan0 -r 192.168.0.0/24 --ports
 ```
 
-### JSON export
+### JSON Export
 
 ```bash
-sudo python3 netrecon.py -r 192.168.0.0/24 --json results.json
+sudo netreconx -r 192.168.0.0/24 --json results.json
 ```
 
-### CSV export
+### CSV Export
 
 ```bash
-sudo python3 netrecon.py -r 192.168.0.0/24 --csv results.csv
+sudo netreconx -r 192.168.0.0/24 --csv results.csv
 ```
 
-### Parsable output
+### Parsable Output
 
 ```bash
-sudo python3 netrecon.py -r 192.168.0.0/24 -P
+sudo netreconx -r 192.168.0.0/24 -P
 ```
 
 ---
@@ -135,6 +159,7 @@ sudo python3 netrecon.py -r 192.168.0.0/24 -P
 -f, --fast              Fast scan
 -c, --count N            ARP request count
 -s, --sleep MS           Delay between requests
+-S, --suppress           Suppress per-packet sleep
 -n, --node OCTET         Source IP last octet
 -P, --parsable           Parsable output
 -L, --listen             Continue listening
