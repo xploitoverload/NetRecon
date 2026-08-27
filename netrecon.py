@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-╔═══════════════════════════════════════════════════════╗
-║              N E T R E C O N  v1.0                    ║
-║         Autonomous Local Network Scanner              ║
-║         github.com/xploitoverload  |  Hack.The.Planet ║
-╚═══════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║              N E T R E C O N  v2.0                           ║
+║         Autonomous Local Network Scanner                     ║
+║         github.com/xploitoverload  |  Hack.The.Planet        ║
+╚═══════════════════════════════════════════════════════════════╝
 
-ARP-based network discovery tool.
-Zero config — auto-detects interface, subnet, and gateway.
+Full-featured ARP-based network discovery tool.
+Active/passive scanning, interactive TUI, parsable output,
+live monitor, port scan, JSON/CSV export.
+
+Developer  : Kalpesh Solanki (xploitoverload)
+Inspired by: netdiscover by Jaime Penalba <jpenalbae@gmail.com>
+             https://github.com/netdiscover-scanner/netdiscover
 """
 
 import sys
@@ -15,8 +20,10 @@ import os
 import json
 import csv
 import time
+import curses
 import socket
 import struct
+import signal
 import argparse
 import threading
 import ipaddress
@@ -28,11 +35,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 MISSING = []
 try:
     from scapy.all import (
-        ARP, Ether, srp, conf as scapy_conf,
-        get_if_list, get_if_hwaddr, get_if_addr,
+        ARP, Ether, srp, sniff, sendp, conf as scapy_conf,
+        get_if_hwaddr,
     )
-    from scapy.layers.inet import IP, TCP
-    from scapy.sendrecv import sr1
     HAS_SCAPY = True
 except ImportError:
     HAS_SCAPY = False
@@ -49,97 +54,151 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-    from rich.text import Text
-    from rich.live import Live
+    from rich.progress import (Progress, SpinnerColumn, BarColumn,
+                               TextColumn, TimeElapsedColumn)
     from rich import box
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
     MISSING.append("rich")
 
+# ── Import OUI table ──────────────────────────────────────────────────────────
 try:
-    import requests
-    HAS_REQUESTS = True
+    from oui_table import OUI_TABLE
 except ImportError:
-    HAS_REQUESTS = False
+    OUI_TABLE = {}   # fallback: empty, scapy manuf db used instead
 
-# ── Console ───────────────────────────────────────────────────────────────────
+# ── Console (used only outside curses TUI) ────────────────────────────────────
 console = Console(highlight=False) if HAS_RICH else None
 
 C = {
     "purple": "\033[95m", "cyan": "\033[96m", "green": "\033[92m",
-    "yellow": "\033[93m", "red": "\033[91m", "bold": "\033[1m",
-    "dim": "\033[2m", "reset": "\033[0m",
+    "yellow": "\033[93m", "red":    "\033[91m", "bold":  "\033[1m",
+    "dim":    "\033[2m",  "reset":  "\033[0m",
 }
 
-OUI_TABLE = {
-    "00:50:56": "VMware",         "00:0C:29": "VMware",
-    "00:1A:11": "Google",         "B8:27:EB": "Raspberry Pi",
-    "DC:A6:32": "Raspberry Pi",   "E4:5F:01": "Raspberry Pi",
-    "00:1B:21": "Intel",          "8C:8D:28": "Intel",
-    "00:25:96": "Cisco",          "00:1E:13": "Cisco",
-    "FC:FB:FB": "Cisco",          "00:0D:3A": "Microsoft",
-    "00:15:5D": "Microsoft (Hyper-V)", "00:50:F2": "Microsoft",
-    "AC:BC:32": "Apple",          "00:1C:B3": "Apple",
-    "98:01:A7": "Apple",          "3C:15:C2": "Apple",
-    "00:1A:73": "Apple",          "18:65:90": "Apple",
-    "60:67:20": "Apple",          "A4:5E:60": "Apple",
-    "00:16:CB": "Apple",          "00:17:F2": "Apple",
-    "78:4F:43": "Apple",          "34:AB:37": "Apple",
-    "00:26:B9": "Dell",           "18:03:73": "Dell",
-    "F0:1F:AF": "Dell",           "00:14:22": "Dell",
-    "00:21:70": "Dell",           "00:25:64": "Apple",
-    "CC:AF:78": "Huawei",         "00:E0:FC": "Huawei",
-    "00:18:82": "Huawei",         "AC:CF:23": "Asus",
-    "00:26:18": "Asus",           "04:D4:C4": "Asus",
-    "00:11:2F": "Asus",           "B0:6E:BF": "TP-Link",
-    "54:C8:0F": "TP-Link",        "50:C7:BF": "TP-Link",
-    "D4:EE:07": "TP-Link",        "C4:E9:84": "TP-Link",
-    "14:CF:92": "TP-Link",        "F4:F2:6D": "TP-Link",
-    "00:1D:0F": "Netgear",        "20:4E:7F": "Netgear",
-    "C0:FF:D4": "Netgear",        "00:14:6C": "Netgear",
-    "00:1E:2A": "Netgear",        "10:0D:7F": "Netgear",
-    "00:22:3F": "D-Link",         "1C:7E:E5": "D-Link",
-    "78:54:2E": "D-Link",         "00:1C:F0": "D-Link",
-    "00:15:E9": "D-Link",         "00:90:4B": "Gemtek",
-    "00:0F:66": "Samsung",        "78:1F:DB": "Samsung",
-    "8C:F5:A3": "Samsung",        "00:07:AB": "Samsung",
-    "A0:10:81": "Samsung",        "5C:F3:70": "Xiaomi",
-    "00:9E:C8": "Xiaomi",         "58:44:98": "Xiaomi",
-    "AC:F7:F3": "Xiaomi",         "64:CC:2E": "Xiaomi",
-    "00:1A:2B": "Fujitsu",        "00:26:73": "Belkin",
-    "00:30:BD": "Belkin",         "94:10:3E": "Belkin",
-}
+VERSION = "2.0"
 
-#
-# Strategy use the OS routing table as the authoritative source.
-#   — open UDP socket to 8.8.8.8:80, read bound address.
-#     Kernel fills in the correct source IP with zero
-#     packets sent. Works on every Linux without root.
-#  — parse `ip route get 8.8.8.8` output.
-#  — iterate all interfaces, cross-ref with gateway.
-#
+# ── Common networks — netdiscover default auto-scan list ──────────────────────
+COMMON_NETWORKS = [
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "172.16.0.0/16", "172.17.0.0/16", "172.18.0.0/16", "172.19.0.0/16",
+    "172.20.0.0/16", "172.21.0.0/16", "172.22.0.0/16", "172.23.0.0/16",
+    "172.24.0.0/16", "172.25.0.0/16", "172.26.0.0/16", "172.27.0.0/16",
+    "172.28.0.0/16", "172.29.0.0/16", "172.30.0.0/16", "172.31.0.0/16",
+    "10.0.0.0/8",
+]
 
-# ── Virtual/irrelevant interface name prefixes to always ignore ───────────────
+# ── Fast mode last octets ─────────────────────────────────────────────────────
+FAST_IPS = ["1", "2", "100", "200", "254"]
+
+# ── Common ports for optional port scan ───────────────────────────────────────
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143,
+                443, 445, 3306, 3389, 5900, 8080, 8443, 9100]
+
+# ── Virtual interface prefixes to skip ───────────────────────────────────────
 _SKIP_PREFIXES = (
     "lo", "virbr", "docker", "veth", "br-", "vmnet",
     "dummy", "tunl", "sit", "ip6tnl", "gre", "tun",
 )
 
+# ── Screen view modes (same as netdiscover) ───────────────────────────────────
+SMODE_REPLY   = 0
+SMODE_REQUEST = 1
+SMODE_HELP    = 2
+SMODE_HOST    = 3
+
+# =============================================================================
+# DATA LAYER
+# Three independent registries mirroring netdiscover's data_reply,
+# data_request, data_unique.
+# =============================================================================
+
+class DataRegistry:
+    """Single host entry — mirrors struct data_registry."""
+    __slots__ = ("ip", "mac", "vendor", "hostname", "arp_type",
+                 "count", "tlength", "focused")
+
+    def __init__(self, ip, mac, vendor, hostname, arp_type, length):
+        self.ip       = ip
+        self.mac      = mac
+        self.vendor   = vendor
+        self.hostname = hostname
+        self.arp_type = arp_type   # "reply" | "request"
+        self.count    = 1
+        self.tlength  = length
+        self.focused  = False      # True = known host (from -m file)
+
+
+class DataLayer:
+    """
+    Thread-safe list of DataRegistry entries.
+    Mirrors netdiscover's data_al abstraction layer.
+    """
+    def __init__(self, name: str):
+        self.name    = name
+        self._list: list[DataRegistry] = []
+        self._lock   = threading.Lock()
+        self.packets = 0
+        self.total_length = 0
+
+    def add(self, entry: DataRegistry, dedup_key=None):
+        """
+        Add or update. dedup_key is a callable(existing, new) -> bool
+        returning True if they are duplicates.
+        """
+        with self._lock:
+            self.packets     += 1
+            self.total_length += entry.tlength
+            if dedup_key:
+                for existing in self._list:
+                    if dedup_key(existing, entry):
+                        existing.count   += 1
+                        existing.tlength += entry.tlength
+                        return False   # duplicate — not added
+            self._list.append(entry)
+            return True   # new entry
+
+    def hosts_count(self) -> int:
+        with self._lock:
+            return len(self._list)
+
+    def snapshot(self) -> list[DataRegistry]:
+        with self._lock:
+            return list(self._list)
+
+    def clear(self):
+        with self._lock:
+            self._list.clear()
+            self.packets = 0
+            self.total_length = 0
+
+
+# Global data layers — same role as _data_reply, _data_request, _data_unique
+data_reply   = DataLayer("ARP Reply")
+data_request = DataLayer("ARP Request")
+data_unique  = DataLayer("Unique Hosts")
+
+# Dedup functions
+def _dedup_reply(a: DataRegistry, b: DataRegistry) -> bool:
+    return a.ip == b.ip and a.mac == b.mac
+
+def _dedup_request(a: DataRegistry, b: DataRegistry) -> bool:
+    return a.ip == b.ip and a.mac == b.mac
+
+def _dedup_unique(a: DataRegistry, b: DataRegistry) -> bool:
+    return a.ip == b.ip and a.mac == b.mac
+
+# =============================================================================
+# INTERFACE DETECTION
+# =============================================================================
 
 def _is_virtual(name: str) -> bool:
     return any(name.startswith(p) for p in _SKIP_PREFIXES)
 
 
-# ── socket routing trick ────────────────────────────────────────────
-
-def _active_ip_via_socket() -> str | None:
-    """
-    Open a UDP socket toward 8.8.8.8:80 without sending any packet.
-    The kernel selects the source address using the routing table.
-    Returns the local IP string, or None on failure.
-    """
+def _active_ip_via_socket() -> "str | None":
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0)
@@ -151,24 +210,15 @@ def _active_ip_via_socket() -> str | None:
         return None
 
 
-# ── `ip route get` ─────────────────────────────────────────────────
-
-def _active_ip_via_ip_route() -> tuple[str, str] | tuple[None, None]:
-    """
-    Run `ip route get 8.8.8.8`.
-    Returns (local_ip, iface_name) or (None, None).
-    Example output:
-      8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.105 uid 0
-    """
+def _active_ip_via_ip_route() -> "tuple[str,str] | tuple[None,None]":
     try:
         out = subprocess.check_output(
             ["ip", "route", "get", "8.8.8.8"],
-            text=True, stderr=subprocess.DEVNULL
-        )
+            text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             parts = line.split()
-            ip   = parts[parts.index("src")  + 1] if "src"  in parts else None
-            dev  = parts[parts.index("dev")  + 1] if "dev"  in parts else None
+            ip  = parts[parts.index("src") + 1] if "src" in parts else None
+            dev = parts[parts.index("dev") + 1] if "dev" in parts else None
             if ip and dev and not ip.startswith("127."):
                 return ip, dev
     except Exception:
@@ -176,83 +226,30 @@ def _active_ip_via_ip_route() -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
-# ── /proc/net/fib_trie prefix-length reader ───────────────────────────────────
-
-def _prefix_len_from_fib_trie(target_ip: str) -> int | None:
-    """
-    Parse /proc/net/fib_trie to find the prefix length of the local subnet
-    that contains target_ip. Returns prefix length int or None.
-    """
-    try:
-        with open("/proc/net/fib_trie") as f:
-            content = f.read()
-
-        # Find LOCAL entries with our IP; the preceding line has the prefix
-        lines = content.splitlines()
-        for i, line in enumerate(lines):
-            if target_ip in line and "LOCAL" in line:
-                # Walk up to find the closest prefix/len line
-                for j in range(i - 1, max(i - 6, 0), -1):
-                    m = lines[j].strip()
-                    if "/" in m:
-                        # Format: "+-- 192.168.1.0/24 ..."
-                        cidr_part = m.split()[1] if len(m.split()) > 1 else m.split("/")[0] + "/" + m.split("/")[1].split()[0]
-                        try:
-                            prefix = int(cidr_part.split("/")[1])
-                            return prefix
-                        except Exception:
-                            pass
-    except Exception:
-        pass
-    return None
-
-
-def _iface_details_from_ip_addr(iface: str, local_ip: str) -> tuple[str, str]:
-  
+def _iface_details_from_ip_addr(iface: str, local_ip: str):
     netmask = "255.255.255.0"
     mac = "??:??:??:??:??:??"
     try:
         out = subprocess.check_output(
             ["ip", "addr", "show", iface],
-            text=True, stderr=subprocess.DEVNULL
-        )
+            text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             line = line.strip()
-            # MAC line: "link/ether aa:bb:cc:dd:ee:ff brd ..."
             if line.startswith("link/ether"):
                 mac = line.split()[1]
-            # IP line: "inet 192.168.1.105/24 brd ..."
             if line.startswith("inet ") and local_ip in line:
-                cidr_part = line.split()[1]   # e.g. "192.168.1.105/24"
-                prefix = int(cidr_part.split("/")[1])
-                net = ipaddress.IPv4Network(f"0.0.0.0/{prefix}")
-                netmask = str(net.netmask)
+                prefix = int(line.split()[1].split("/")[1])
+                netmask = str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask)
     except Exception:
         pass
     return netmask, mac
 
 
-def _iface_for_ip_netifaces(local_ip: str) -> str | None:
-    """Find which interface name owns a given local IP, using netifaces."""
-    if not HAS_NETIFACES:
-        return None
-    for iface in netifaces.interfaces():
-        if _is_virtual(iface):
-            continue
-        addrs = netifaces.ifaddresses(iface)
-        for entry in addrs.get(netifaces.AF_INET, []):
-            if entry.get("addr") == local_ip:
-                return iface
-    return None
-
-
-def _iface_for_ip_proc(local_ip: str) -> str | None:
-    """Find which interface name owns a given local IP via `ip addr`."""
+def _iface_for_ip_proc(local_ip: str) -> "str | None":
     try:
         out = subprocess.check_output(
             ["ip", "-o", "-4", "addr"],
-            text=True, stderr=subprocess.DEVNULL
-        )
+            text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             parts = line.split()
             if len(parts) < 4:
@@ -260,15 +257,14 @@ def _iface_for_ip_proc(local_ip: str) -> str | None:
             iface = parts[1]
             if _is_virtual(iface):
                 continue
-            addr_cidr = parts[3]  # "192.168.1.105/24"
-            if addr_cidr.split("/")[0] == local_ip:
+            if parts[3].split("/")[0] == local_ip:
                 return iface
     except Exception:
         pass
     return None
 
 
-def _full_record_netifaces(iface: str, local_ip: str) -> tuple[str, str, str, str] | None:
+def _full_record_netifaces(iface: str, local_ip: str):
     if not HAS_NETIFACES:
         return None
     try:
@@ -285,12 +281,8 @@ def _full_record_netifaces(iface: str, local_ip: str) -> tuple[str, str, str, st
     return None
 
 
-# ── Primary entry point ───────────────────────────────────────────────────────
-
-def detect_active_interface() -> tuple[str, str, str, str] | None:
-
+def detect_active_interface():
     local_ip = _active_ip_via_socket()
-  
     iface_name = None
     iproute_ip, iproute_iface = _active_ip_via_ip_route()
 
@@ -301,9 +293,19 @@ def detect_active_interface() -> tuple[str, str, str, str] | None:
 
     if not local_ip:
         return None
-      
+
     if not iface_name:
-        iface_name = _iface_for_ip_netifaces(local_ip) or _iface_for_ip_proc(local_ip)
+        if HAS_NETIFACES:
+            for iface in netifaces.interfaces():
+                if _is_virtual(iface):
+                    continue
+                addrs = netifaces.ifaddresses(iface)
+                for e in addrs.get(netifaces.AF_INET, []):
+                    if e.get("addr") == local_ip:
+                        iface_name = iface
+                        break
+        if not iface_name:
+            iface_name = _iface_for_ip_proc(local_ip)
 
     if not iface_name:
         return None
@@ -316,8 +318,7 @@ def detect_active_interface() -> tuple[str, str, str, str] | None:
     return (iface_name, local_ip, netmask, mac)
 
 
-def detect_all_interfaces() -> list[tuple[str, str, str, str]]:
-
+def detect_all_interfaces():
     results = []
     if HAS_NETIFACES:
         for iface in netifaces.interfaces():
@@ -327,8 +328,8 @@ def detect_all_interfaces() -> list[tuple[str, str, str, str]]:
             if netifaces.AF_INET not in addrs:
                 continue
             for entry in addrs[netifaces.AF_INET]:
-                ip = entry.get("addr", "")
-                nm = entry.get("netmask", "255.255.255.0")
+                ip  = entry.get("addr", "")
+                nm  = entry.get("netmask", "255.255.255.0")
                 mac = ""
                 if netifaces.AF_LINK in addrs:
                     mac = addrs[netifaces.AF_LINK][0].get("addr", "??:??:??:??:??:??")
@@ -337,8 +338,7 @@ def detect_all_interfaces() -> list[tuple[str, str, str, str]]:
     else:
         try:
             out = subprocess.check_output(
-                ["ip", "-o", "-4", "addr"], text=True, stderr=subprocess.DEVNULL
-            )
+                ["ip", "-o", "-4", "addr"], text=True, stderr=subprocess.DEVNULL)
             for line in out.splitlines():
                 parts = line.split()
                 if len(parts) < 4:
@@ -350,7 +350,7 @@ def detect_all_interfaces() -> list[tuple[str, str, str, str]]:
                 ip = addr_cidr.split("/")[0]
                 prefix = int(addr_cidr.split("/")[1])
                 nm = str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask)
-                mac = _get_mac_from_ip_link(iface)
+                mac = _get_mac_ip_link(iface)
                 if not ip.startswith("127."):
                     results.append((iface, ip, nm, mac))
         except Exception:
@@ -358,11 +358,10 @@ def detect_all_interfaces() -> list[tuple[str, str, str, str]]:
     return results
 
 
-def _get_mac_from_ip_link(iface: str) -> str:
+def _get_mac_ip_link(iface: str) -> str:
     try:
         out = subprocess.check_output(
-            ["ip", "link", "show", iface], text=True, stderr=subprocess.DEVNULL
-        )
+            ["ip", "link", "show", iface], text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("link/ether"):
@@ -373,71 +372,65 @@ def _get_mac_from_ip_link(iface: str) -> str:
 
 
 def iface_to_cidr(ip: str, netmask: str) -> str:
-    net = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-    return str(net)
+    return str(ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False))
 
 
-def detect_gateway() -> str | None:
+def detect_gateway() -> "str | None":
     if HAS_NETIFACES:
         try:
             gws = netifaces.gateways()
-            gw = gws.get("default", {}).get(netifaces.AF_INET, [None])[0]
+            gw  = gws.get("default", {}).get(netifaces.AF_INET, [None])[0]
             if gw:
                 return gw
         except Exception:
             pass
-          
-    try:
-        out = subprocess.check_output(
-            ["ip", "route", "show", "default"],
-            text=True, stderr=subprocess.DEVNULL
-        )
-        for line in out.splitlines():
-            parts = line.split()
-            if "via" in parts:
-                return parts[parts.index("via") + 1]
-    except Exception:
-        pass
-
-    _, iproute_iface = _active_ip_via_ip_route()
-    try:
-        out = subprocess.check_output(
-            ["ip", "route", "get", "8.8.8.8"],
-            text=True, stderr=subprocess.DEVNULL
-        )
-        for line in out.splitlines():
-            parts = line.split()
-            if "via" in parts:
-                return parts[parts.index("via") + 1]
-    except Exception:
-        pass
-
+    for cmd in (["ip", "route", "show", "default"],
+                ["ip", "route", "get", "8.8.8.8"]):
+        try:
+            out = subprocess.check_output(
+                cmd, text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if "via" in parts:
+                    return parts[parts.index("via") + 1]
+        except Exception:
+            pass
     return None
 
 
+def resolve_forced_iface(iface_name: str):
+    for rec in detect_all_interfaces():
+        if rec[0] == iface_name:
+            return rec
+    _print_err(f"Interface '{iface_name}' not found or has no IPv4.")
+    sys.exit(1)
+
+# =============================================================================
+# VENDOR / HOSTNAME LOOKUP
+# =============================================================================
 
 def lookup_vendor(mac: str) -> str:
-    if not mac or mac == "??:??:??:??:??:??":
-        return "Unknown"
+    if not mac or mac in ("??:??:??:??:??:??", "N/A", ""):
+        return "Unknown vendor"
     mac_upper = mac.upper()
-    oui = mac_upper[:8]  
+    oui = mac_upper[:8]
+    # Try full OUI table first (37k+ entries)
     if oui in OUI_TABLE:
         return OUI_TABLE[oui]
-
+    # Fallback: scapy manuf db
     if HAS_SCAPY:
         try:
-            from scapy.data import ETHER_TYPES
             from scapy.libs.manuf import ManufDB
-            db = ManufDB()
+            db     = ManufDB()
             result = db.get(mac)
             if result:
-                return result[1] or result[0] or "Unknown"
+                return result[1] or result[0] or "Unknown vendor"
         except Exception:
             pass
-    return "Unknown"
+    return "Unknown vendor"
 
 
-def resolve_hostname(ip: str, timeout: float = 0.25) -> str:
+def resolve_hostname(ip: str, timeout: float = 0.3) -> str:
     try:
         old = socket.getdefaulttimeout()
         socket.setdefaulttimeout(timeout)
@@ -447,192 +440,261 @@ def resolve_hostname(ip: str, timeout: float = 0.25) -> str:
     except Exception:
         return ""
 
+# =============================================================================
+# KNOWN MAC TABLE  (netdiscover -m flag)
+# =============================================================================
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Speed strategy:
-#   • Split subnet into chunks of 32 IPs each
-#   • Scan all chunks concurrently in a thread pool
-#   • Each thread runs its own srp() with a short timeout (0.8s)
-#   • No inter-packet delay — kernel handles buffering fine on LAN
-#   • Result dedup via IP-keyed dict (handles duplicate ARP replies)
-#   • arp-scan binary fallback with --bandwidth flag for max throughput
-#   • Raw socket ICMP ping last resort — single socket, no fork overhead
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_ARP_CHUNK    = 32   
-_ARP_TIMEOUT  = 0.8  
-_ARP_WORKERS  = 16  
-
-def _arp_chunk_worker(args_tuple):
-    ip_list, iface = args_tuple
-    results = []
-    try:
-        pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip) for ip in ip_list]
-        from scapy.all import srp as _srp
-        answered, _ = _srp(
-            pkts,
-            iface=iface,
-            timeout=_ARP_TIMEOUT,
-            verbose=0,
-            inter=0,          
-            retry=1,         
-        )
-        for _, rcv in answered:
-            results.append((rcv[ARP].psrc, rcv[Ether].src.upper()))
-    except Exception:
-        pass
-    return results
+known_mac_table: dict[str, str] = {}   # MAC_UPPER_NOCOLON -> hostname
 
 
-def arp_scan_scapy_fast(cidr: str, iface: str) -> list[dict]:
-    scapy_conf.verb = 0
-
-    net   = ipaddress.IPv4Network(cidr, strict=False)
-    hosts = [str(h) for h in net.hosts()]
-
-    chunks = [hosts[i:i + _ARP_CHUNK] for i in range(0, len(hosts), _ARP_CHUNK)]
-    work   = [(chunk, iface) for chunk in chunks]
-
-    seen: dict[str, str] = {}  
-    try:
-        with ThreadPoolExecutor(max_workers=_ARP_WORKERS) as ex:
-            for batch_result in ex.map(_arp_chunk_worker, work):
-                for ip, mac in batch_result:
-                    seen[ip] = mac
-    except PermissionError:
-        print_err("Root privileges required. Run with sudo.")
-        sys.exit(1)
-    except Exception as e:
-        _vprint(True, f"[!] Scapy parallel scan error: {e}")
-        return []
-
-    return [{"ip": ip, "mac": mac, "vendor": "", "hostname": ""}
-            for ip, mac in seen.items()]
-
-
-def arp_scan_binary(cidr: str, iface: str) -> list[dict]:
-    try:
-        cmd = [
-            "arp-scan",
-            f"--interface={iface}",
-            "--retry=2",
-            "--timeout=400",          
-            "--bandwidth=1000000",    
-            cidr,
-        ]
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        return []
-    except subprocess.CalledProcessError:
-        return []
-
-    devices = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2 and parts[0] and parts[0][0].isdigit():
-            ip  = parts[0].strip()
-            mac = parts[1].strip().upper()
-            devices.append({"ip": ip, "mac": mac, "vendor": "", "hostname": ""})
-    return devices
-
-
-def _build_icmp(seq: int) -> bytes:
-    header = struct.pack("bbHHh", 8, 0, 0, os.getpid() & 0xFFFF, seq)
-    checksum = 0
-    for i in range(0, len(header), 2):
-        checksum += (header[i] << 8) + header[i + 1]
-    checksum = (checksum >> 16) + (checksum & 0xFFFF)
-    checksum = ~checksum & 0xFFFF
-    header = struct.pack("bbHHh", 8, 0, socket.htons(checksum), os.getpid() & 0xFFFF, seq)
-    return header
-
-
-def _ping_raw(ip: str, timeout: float = 0.4) -> bool:
+def load_known_mac_table(filepath: str) -> bool:
     """
-    Send one ICMP echo request via raw socket and wait for reply.
-    No subprocess fork — dramatically faster at scale.
-    Returns True if host responds.
+    Load known MACs file.  Format per line:
+        AA:BB:CC:DD:EE:FF  hostname
+    Returns True on success.
     """
+    global known_mac_table
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        s.settimeout(timeout)
-        s.sendto(_build_icmp(1), (ip, 0))
-        s.recvfrom(1024)
-        s.close()
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                mac  = parts[0].upper().replace(":", "").replace("-", "")
+                host = parts[1].strip()
+                if len(mac) == 12:
+                    known_mac_table[mac] = host
         return True
     except Exception:
         return False
 
 
-def _mac_from_arp_cache(ip: str) -> str:
+def search_known_mac(mac: str) -> "str | None":
+    key = mac.upper().replace(":", "").replace("-", "")
+    return known_mac_table.get(key)
+
+# =============================================================================
+# OWN MAC CACHE — ignore our own injected packets
+# =============================================================================
+
+_OWN_MAC: str = ""
+
+
+def inject_init(iface: str):
+    global _OWN_MAC
     try:
-        with open("/proc/net/arp") as f:
-            for line in f.readlines()[1:]:
-                parts = line.split()
-                if parts and parts[0] == ip and parts[2] == "0x2":
-                    return parts[3].upper()
+        if HAS_SCAPY:
+            _OWN_MAC = get_if_hwaddr(iface).upper()
+        else:
+            _OWN_MAC = _get_mac_ip_link(iface).upper()
+    except Exception:
+        _OWN_MAC = ""
+
+# =============================================================================
+# PACKET PROCESSING  (mirrors process_packet + process_arp_header)
+# =============================================================================
+
+def _process_packet(pkt):
+    """Called for every captured packet by scapy sniff()."""
+    if not pkt.haslayer(ARP):
+        return
+
+    arp = pkt[ARP]
+    eth = pkt[Ether]
+
+    src_mac = eth.src.upper()
+    src_ip  = arp.psrc
+    dst_ip  = arp.pdst
+    length  = len(pkt)
+    op      = arp.op   # 1=request  2=reply
+
+    # Ignore our own packets
+    if _OWN_MAC and src_mac == _OWN_MAC:
+        return
+    if not src_ip or src_ip == "0.0.0.0":
+        return
+
+    arp_type = "reply" if op == 2 else "request"
+
+    # Vendor + hostname
+    known_host = search_known_mac(src_mac)
+    if known_host:
+        vendor   = known_host
+        focused  = True
+    else:
+        vendor  = lookup_vendor(src_mac)
+        focused = False
+
+    hostname = resolve_hostname(src_ip)
+
+    entry = DataRegistry(src_ip, src_mac, vendor, hostname, arp_type, length)
+    entry.focused = focused
+
+    # unique hosts (mirrors data_unique — dedup by IP+MAC)
+    data_unique.add(entry, dedup_key=_dedup_unique)
+
+    # per-type lists
+    if op == 2:
+        data_reply.add(entry, dedup_key=_dedup_reply)
+    else:
+        data_request.add(entry, dedup_key=_dedup_request)
+
+    # parsable output — printed immediately if enabled
+    if _parsable_output:
+        _parsable_print(entry)
+
+# =============================================================================
+# ARP INJECTION  (mirrors forge_arp + scan_range + scan_net)
+# =============================================================================
+
+def forge_arp(src_ip: str, dst_ip: str, iface: str):
+    if not HAS_SCAPY:
+        return
+    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, pdst=dst_ip, psrc=src_ip)
+    sendp(pkt, iface=iface, verbose=0)
+
+
+def _get_fast_hosts(cidr: str) -> list:
+    net  = ipaddress.IPv4Network(cidr, strict=False)
+    base = str(net.network_address).rsplit(".", 1)[0]
+    hosts = []
+    for last in FAST_IPS:
+        ip = f"{base}.{last}"
+        try:
+            if ipaddress.IPv4Address(ip) in net:
+                hosts.append(ip)
+        except Exception:
+            pass
+    return hosts
+
+
+def inject_range(cidr: str, iface: str, src_node: int,
+                 repeat: int, sleep_ms: int, suppress_sleep: bool,
+                 fast_mode: bool, stop_event: threading.Event,
+                 current_network_ref: list):
+    """
+    Inject ARP requests over a CIDR — mirrors inject_arp + scan_range.
+    current_network_ref[0] is updated with current CIDR for display.
+    """
+    net = ipaddress.IPv4Network(cidr, strict=False)
+    current_network_ref[0] = cidr
+
+    if fast_mode:
+        hosts = _get_fast_hosts(cidr)
+    else:
+        hosts = [str(h) for h in net.hosts()]
+
+    # Source IP: first host with last octet replaced by src_node
+    base   = str(net.network_address).rsplit(".", 1)[0]
+    src_ip = f"{base}.{src_node}"
+    if not hosts:
+        return
+
+    for _ in range(repeat):
+        if stop_event.is_set():
+            break
+        for ip in hosts:
+            if stop_event.is_set():
+                break
+            forge_arp(src_ip, ip, iface)
+            if not suppress_sleep:
+                delay = (sleep_ms / 1000.0) if sleep_ms else 0.001
+                time.sleep(delay)
+        if suppress_sleep:
+            delay = (sleep_ms / 1000.0) if sleep_ms else 0.001
+            time.sleep(delay)
+
+# =============================================================================
+# SNIFFER THREAD  (mirrors start_sniffer)
+# =============================================================================
+
+def start_sniffer(iface: str, pcap_filter: str, stop_event: threading.Event):
+    def _stop_fn(_):
+        return stop_event.is_set()
+
+    sniff(
+        iface=iface,
+        filter=pcap_filter,
+        prn=_process_packet,
+        stop_filter=_stop_fn,
+        store=False,
+    )
+
+# =============================================================================
+# FAST ACTIVE SCAN (NetRecon original — parallel srp chunks)
+# Used when passive=False to supplement injection-based scan
+# =============================================================================
+
+_ARP_CHUNK   = 32
+_ARP_TIMEOUT = 0.8
+_ARP_WORKERS = 16
+
+
+def _arp_chunk_worker(args_tuple):
+    ip_list, iface = args_tuple
+    results = []
+    try:
+        pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+                for ip in ip_list]
+        answered, _ = srp(pkts, iface=iface, timeout=_ARP_TIMEOUT,
+                          verbose=0, inter=0, retry=1)
+        for _, rcv in answered:
+            results.append((rcv[ARP].psrc, rcv[Ether].src.upper(), len(rcv)))
     except Exception:
         pass
-    return "N/A"
+    return results
 
 
-def ping_sweep_fast(cidr: str) -> list[dict]:
+def fast_arp_scan(cidr: str, iface: str):
+    """Parallel chunk-based ARP scan — feeds results into data layers."""
+    scapy_conf.verb = 0
     net   = ipaddress.IPv4Network(cidr, strict=False)
     hosts = [str(h) for h in net.hosts()]
+    chunks = [hosts[i:i + _ARP_CHUNK]
+              for i in range(0, len(hosts), _ARP_CHUNK)]
+    work = [(c, iface) for c in chunks]
 
-    alive: list[str] = []
+    with ThreadPoolExecutor(max_workers=_ARP_WORKERS) as ex:
+        for batch in ex.map(_arp_chunk_worker, work):
+            for ip, mac, length in batch:
+                known_host = search_known_mac(mac)
+                vendor   = known_host if known_host else lookup_vendor(mac)
+                focused  = bool(known_host)
+                hostname = resolve_hostname(ip)
+                entry    = DataRegistry(ip, mac, vendor, hostname,
+                                        "reply", length)
+                entry.focused = focused
+                data_unique.add(entry, dedup_key=_dedup_unique)
+                data_reply.add(entry,  dedup_key=_dedup_reply)
 
-    with ThreadPoolExecutor(max_workers=min(256, len(hosts))) as ex:
-        futures = {ex.submit(_ping_raw, ip): ip for ip in hosts}
-        for f in as_completed(futures):
-            ip = futures[f]
-            try:
-                if f.result():
-                    alive.append(ip)
-            except Exception:
-                pass
+# =============================================================================
+# PARSABLE OUTPUT  (mirrors netdiscover -P / -L)
+# =============================================================================
 
-    # Brief pause to let ARP cache populate
-    time.sleep(0.3)
-
-    devices = []
-    for ip in alive:
-        mac = _mac_from_arp_cache(ip)
-        devices.append({"ip": ip, "mac": mac, "vendor": "", "hostname": ""})
-    return devices
-
-
-def scan_network(cidr: str, iface: str, verbose: bool = False) -> list[dict]:
-  
-    net = ipaddress.IPv4Network(cidr, strict=False)
-    _vprint(verbose, f"[*] Subnet: {cidr}  ({net.num_addresses - 2} hosts to scan)")
-
-    if HAS_SCAPY:
-        _vprint(verbose, f"[*] Method: Scapy parallel ARP  (iface={iface})")
-        devices = arp_scan_scapy_fast(cidr, iface)
-        if devices:
-            _vprint(verbose, f"[*] Scapy found {len(devices)} device(s)")
-            return devices
-        _vprint(verbose, "[~] Scapy ARP returned 0 results, trying arp-scan binary...")
-
-    _vprint(verbose, "[*] Method: arp-scan binary")
-    devices = arp_scan_binary(cidr, iface)
-    if devices:
-        _vprint(verbose, f"[*] arp-scan found {len(devices)} device(s)")
-        return devices
-    _vprint(verbose, "[~] arp-scan not available or found nothing, falling back to ping sweep...")
-
-    _vprint(verbose, "[*] Method: Raw ICMP ping sweep (MAC from ARP cache)")
-    devices = ping_sweep_fast(cidr)
-    _vprint(verbose, f"[*] Ping sweep found {len(devices)} device(s)")
-    return devices
+_parsable_output   = False
+_continue_listening = False
+_no_header         = False
 
 
-COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143,
-                443, 445, 3306, 3389, 5900, 8080, 8443, 9100]
+def _parsable_print(entry: DataRegistry):
+    print(f"  {entry.ip:<16}  {entry.mac:<18}  "
+          f"{entry.count:<5}  {entry.tlength:<7}  {entry.vendor}")
+    sys.stdout.flush()
 
-def tcp_scan_host(ip: str, ports: list[int] = COMMON_PORTS, timeout: float = 0.5) -> list[int]:
-    open_ports = []
+
+def print_parsable_header():
+    print(" _____________________________________________________________________________")
+    print("   IP            At MAC Address     Count     Len  MAC Vendor / Hostname      ")
+    print(" -----------------------------------------------------------------------------")
+
+# =============================================================================
+# PORT SCAN  (NetRecon feature)
+# =============================================================================
+
+def tcp_scan_host(ip: str, ports=COMMON_PORTS, timeout=0.5) -> list:
     def check(port):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -643,59 +705,324 @@ def tcp_scan_host(ip: str, ports: list[int] = COMMON_PORTS, timeout: float = 0.5
         except Exception:
             pass
         return None
-
     with ThreadPoolExecutor(max_workers=len(ports)) as ex:
-        for res in ex.map(check, ports):
-            if res:
-                open_ports.append(res)
-    return sorted(open_ports)
+        return sorted(r for r in ex.map(check, ports) if r)
+
+# =============================================================================
+# EXPORT  (NetRecon feature)
+# =============================================================================
+
+def export_json(devices: list, path: str):
+    data = {
+        "scan_time": datetime.now().isoformat(),
+        "total":     len(devices),
+        "devices":   [
+            {"ip": d.ip, "mac": d.mac, "vendor": d.vendor,
+             "hostname": d.hostname, "count": d.count}
+            for d in devices
+        ],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    _print_ok(f"JSON saved → {path}")
 
 
-def enrich_device(dev: dict, do_ports: bool = False) -> dict:
-    dev["vendor"]   = lookup_vendor(dev["mac"])
-    dev["hostname"] = resolve_hostname(dev["ip"])
-    if do_ports:
-        dev["ports"] = tcp_scan_host(dev["ip"])
-    return dev
+def export_csv(devices: list, path: str):
+    fields = ["ip", "mac", "vendor", "hostname", "count"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for d in devices:
+            w.writerow([d.ip, d.mac, d.vendor, d.hostname, d.count])
+    _print_ok(f"CSV saved → {path}")
+
+# =============================================================================
+# CURSES TUI  (mirrors screen.c — interactive terminal UI)
+# =============================================================================
+
+_tui_smode      = SMODE_HOST
+_tui_scroll     = 0
+_tui_oldmode    = SMODE_HOST
+_current_net    = ["Starting."]   # mutable ref updated by injection thread
+_scan_finished  = [False]
+
+_COLOR_HEADER  = 1
+_COLOR_TITLE   = 2
+_COLOR_KNOWN   = 3
+_COLOR_NORMAL  = 4
+_COLOR_DIM     = 5
 
 
-def enrich_all(devices: list[dict], do_ports: bool = False) -> list[dict]:
-    if not devices:
-        return []
-    workers = min(64, len(devices))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(enrich_device, dev, do_ports): dev for dev in devices}
-        enriched = []
-        for f in as_completed(futures):
-            enriched.append(f.result())
-    enriched.sort(key=lambda d: int(ipaddress.IPv4Address(d["ip"])))
-    return enriched
+def _init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(_COLOR_HEADER, curses.COLOR_CYAN,    -1)
+    curses.init_pair(_COLOR_TITLE,  curses.COLOR_MAGENTA, -1)
+    curses.init_pair(_COLOR_KNOWN,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(_COLOR_NORMAL, -1,                   -1)
+    curses.init_pair(_COLOR_DIM,    curses.COLOR_WHITE,   -1)
 
 
-BANNER = r"""
-  [bold purple]
-  ███╗   ██╗███████╗████████╗██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
-  ████╗  ██║██╔════╝╚══██╔══╝██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
-  ██╔██╗ ██║█████╗     ██║   ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
-  ██║╚██╗██║██╔══╝     ██║   ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
-  ██║ ╚████║███████╗   ██║   ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
-  ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝[/bold purple]
-  [dim purple]          Local Network Recon  •  v1.0  •  Hack.The.Planet[/dim purple]
-"""
+def _current_data() -> DataLayer:
+    if _tui_smode == SMODE_REPLY:
+        return data_reply
+    if _tui_smode == SMODE_REQUEST:
+        return data_request
+    return data_unique
 
 
-def print_banner():
-    if HAS_RICH:
-        console.print(BANNER)
-    else:
-        print(f"{C['purple']}[NETRECON v1.0]{C['reset']} Local Network Recon")
+def _smode_name() -> str:
+    return {
+        SMODE_REPLY:   "ARP Reply",
+        SMODE_REQUEST: "ARP Request",
+        SMODE_HELP:    "Help",
+        SMODE_HOST:    "Unique Hosts",
+    }.get(_tui_smode, "?")
 
 
-def print_err(msg):
+def _draw_status_header(win, rows, cols):
+    status = f" Currently scanning: {_current_net[0]}   |   Screen View: {_smode_name()}"
+    win.addnstr(0, 0, status.ljust(cols - 1),
+                cols - 1, curses.color_pair(_COLOR_TITLE) | curses.A_BOLD)
+    win.addnstr(1, 0, " " * (cols - 1), cols - 1)
+
+
+def _draw_reply_header(win, row, cols):
+    layer = data_reply
+    summary = (f" {layer.packets} Captured ARP Reply packets, "
+               f"from {layer.hosts_count()} hosts.   "
+               f"Total size: {layer.total_length}")
+    win.addnstr(row,     0, summary.ljust(cols - 1),
+                cols - 1, curses.color_pair(_COLOR_HEADER))
+    win.addnstr(row + 1, 0,
+                " _____________________________________________________________________________"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    win.addnstr(row + 2, 0,
+                "   IP            At MAC Address     Count     Len  MAC Vendor / Hostname      "[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_HEADER) | curses.A_BOLD)
+    win.addnstr(row + 3, 0,
+                " -----------------------------------------------------------------------------"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    return row + 4
+
+
+def _draw_request_header(win, row, cols):
+    layer = data_request
+    summary = (f" {layer.packets} Captured ARP Request packets, "
+               f"from {layer.hosts_count()} hosts.   "
+               f"Total size: {layer.total_length}")
+    win.addnstr(row,     0, summary.ljust(cols - 1),
+                cols - 1, curses.color_pair(_COLOR_HEADER))
+    win.addnstr(row + 1, 0,
+                " _____________________________________________________________________________"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    win.addnstr(row + 2, 0,
+                "   IP            At MAC Address      Requests IP      Count                   "[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_HEADER) | curses.A_BOLD)
+    win.addnstr(row + 3, 0,
+                " -----------------------------------------------------------------------------"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    return row + 4
+
+
+def _draw_unique_header(win, row, cols):
+    layer = data_unique
+    summary = (f" {layer.packets} Captured ARP Req/Rep packets, "
+               f"from {layer.hosts_count()} hosts.   "
+               f"Total size: {layer.total_length}")
+    win.addnstr(row,     0, summary.ljust(cols - 1),
+                cols - 1, curses.color_pair(_COLOR_HEADER))
+    win.addnstr(row + 1, 0,
+                " _____________________________________________________________________________"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    win.addnstr(row + 2, 0,
+                "   IP            At MAC Address     Count     Len  MAC Vendor / Hostname      "[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_HEADER) | curses.A_BOLD)
+    win.addnstr(row + 3, 0,
+                " -----------------------------------------------------------------------------"[:cols - 1],
+                cols - 1, curses.color_pair(_COLOR_DIM))
+    return row + 4
+
+
+def _fmt_reply_line(e: DataRegistry, cols: int) -> str:
+    line = (f" {e.ip:<15} {e.mac:<18} {e.count:>5} {e.tlength:>7}  {e.vendor}")
+    return line[:cols - 1].ljust(cols - 1)
+
+
+def _fmt_request_line(e: DataRegistry, cols: int) -> str:
+    line = (f" {e.ip:<15} {e.mac:<18}  {e.hostname or e.ip:<16} {e.count:>5}")
+    return line[:cols - 1].ljust(cols - 1)
+
+
+def _fmt_unique_line(e: DataRegistry, cols: int) -> str:
+    line = (f" {e.ip:<15} {e.mac:<18} {e.count:>5} {e.tlength:>7}  {e.vendor}")
+    return line[:cols - 1].ljust(cols - 1)
+
+
+def _draw_help(win, start_row, rows, cols):
+    help_lines = [
+        "",
+        "   ______________________________________________  ",
+        "  |                                              | ",
+        "  |    Usage Keys                                | ",
+        "  |     h: show this help screen                 | ",
+        "  |     j: scroll down  (or down arrow)          | ",
+        "  |     k: scroll up    (or up arrow)            | ",
+        "  |     .: scroll page down                      | ",
+        "  |     ,: scroll page up                        | ",
+        "  |     q: exit this screen or end               | ",
+        "  |                                              | ",
+        "  |    Screen views                              | ",
+        "  |     a: show arp replies list                 | ",
+        "  |     r: show arp requests list                | ",
+        "  |     u: show unique hosts detected            | ",
+        "  |                                              | ",
+        "   ----------------------------------------------  ",
+        "",
+    ]
+    for i, line in enumerate(help_lines):
+        r = start_row + i
+        if r >= rows - 1:
+            break
+        win.addnstr(r, 0, line[:cols - 1].ljust(cols - 1),
+                    cols - 1, curses.color_pair(_COLOR_DIM))
+
+
+def tui_draw(win):
+    global _tui_scroll
+    win.erase()
+    rows, cols = win.getmaxyx()
+
+    _draw_status_header(win, rows, cols)
+
+    if _tui_smode == SMODE_REPLY:
+        data_row = _draw_reply_header(win, 2, cols)
+        entries  = data_reply.snapshot()
+        fmt_fn   = _fmt_reply_line
+    elif _tui_smode == SMODE_REQUEST:
+        data_row = _draw_request_header(win, 2, cols)
+        entries  = data_request.snapshot()
+        fmt_fn   = _fmt_request_line
+    elif _tui_smode == SMODE_HELP:
+        data_row = _draw_unique_header(win, 2, cols)
+        _draw_help(win, data_row, rows, cols)
+        win.noutrefresh()
+        curses.doupdate()
+        return
+    else:  # SMODE_HOST
+        data_row = _draw_unique_header(win, 2, cols)
+        entries  = data_unique.snapshot()
+        fmt_fn   = _fmt_unique_line
+
+    # Clamp scroll
+    max_scroll = max(0, len(entries) - (rows - data_row - 1))
+    _tui_scroll = max(0, min(_tui_scroll, max_scroll))
+
+    visible = entries[_tui_scroll:]
+    for i, entry in enumerate(visible):
+        r = data_row + i
+        if r >= rows - 1:
+            break
+        line = fmt_fn(entry, cols)
+        attr = (curses.color_pair(_COLOR_KNOWN) | curses.A_BOLD
+                if entry.focused
+                else curses.color_pair(_COLOR_NORMAL))
+        win.addnstr(r, 0, line, cols - 1, attr)
+
+    win.noutrefresh()
+    curses.doupdate()
+
+
+def tui_read_key(win) -> str:
+    """Read one keypress, return action string."""
+    try:
+        ch = win.getch()
+    except Exception:
+        return ""
+    if ch == 27:            # ESC sequence (arrow keys)
+        win.nodelay(True)
+        ch2 = win.getch()
+        win.nodelay(False)
+        if ch2 == 91:
+            ch3 = win.getch()
+            if ch3 == 66:
+                return "down"
+            if ch3 == 65:
+                return "up"
+        return ""
+    mapping = {
+        ord("k"): "up",    ord("j"): "down",
+        ord(","): "pgup",  ord("."): "pgdn",
+        ord("r"): "req",   ord("a"): "rep",
+        ord("u"): "host",  ord("h"): "help",
+        ord("q"): "quit",
+        curses.KEY_UP:   "up",
+        curses.KEY_DOWN: "down",
+    }
+    return mapping.get(ch, "")
+
+
+def run_tui(stdscr, stop_event: threading.Event):
+    global _tui_smode, _tui_scroll, _tui_oldmode
+
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    stdscr.timeout(1000)   # 1s refresh
+    _init_colors()
+
+    while not stop_event.is_set():
+        tui_draw(stdscr)
+        action = tui_read_key(stdscr)
+        rows, _ = stdscr.getmaxyx()
+        page    = max(1, rows - 7)
+
+        if action == "up":
+            if _tui_scroll > 0:
+                _tui_scroll -= 1
+        elif action == "down":
+            _tui_scroll += 1
+        elif action == "pgup":
+            _tui_scroll = max(0, _tui_scroll - page)
+        elif action == "pgdn":
+            _tui_scroll += page
+        elif action == "req":
+            _tui_smode  = SMODE_REQUEST
+            _tui_scroll = 0
+        elif action == "rep":
+            _tui_smode  = SMODE_REPLY
+            _tui_scroll = 0
+        elif action == "host":
+            _tui_smode  = SMODE_HOST
+            _tui_scroll = 0
+        elif action == "help":
+            if _tui_smode != SMODE_HELP:
+                _tui_oldmode = _tui_smode
+                _tui_smode   = SMODE_HELP
+                _tui_scroll  = 0
+        elif action == "quit":
+            if _tui_smode == SMODE_HELP:
+                _tui_smode  = _tui_oldmode
+                _tui_scroll = 0
+            else:
+                stop_event.set()
+                break
+
+# =============================================================================
+# RICH TABLE OUTPUT  (NetRecon feature — used in parsable/non-TUI mode)
+# =============================================================================
+
+def _print_err(msg):
     if HAS_RICH:
         console.print(f"[bold red][!][/bold red] {msg}")
     else:
         print(f"{C['red']}[!]{C['reset']} {msg}")
+
+
+def _print_ok(msg):
+    if HAS_RICH:
+        console.print(f"[bold green][✓][/bold green] {msg}")
+    else:
+        print(f"{C['green']}[✓]{C['reset']} {msg}")
 
 
 def _vprint(verbose, msg):
@@ -707,6 +1034,23 @@ def _vprint(verbose, msg):
         print(f"{C['dim']}{msg}{C['reset']}")
 
 
+def print_banner():
+    banner = f"""
+[bold purple]
+  ███╗   ██╗███████╗████████╗██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+  ████╗  ██║██╔════╝╚══██╔══╝██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
+  ██╔██╗ ██║█████╗     ██║   ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
+  ██║╚██╗██║██╔══╝     ██║   ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
+  ██║ ╚████║███████╗   ██║   ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
+  ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝[/bold purple]
+[dim purple]            Local Network Recon  •  v{VERSION}  •  Hack.The.Planet[/dim purple]
+"""
+    if HAS_RICH:
+        console.print(banner)
+    else:
+        print(f"{C['purple']}[NETRECON v{VERSION}]{C['reset']} Local Network Recon")
+
+
 def print_local_info(ifaces, gateway):
     if HAS_RICH:
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -714,7 +1058,8 @@ def print_local_info(ifaces, gateway):
         t.add_column(style="cyan")
         for (iface, ip, nm, mac) in ifaces:
             cidr = iface_to_cidr(ip, nm)
-            t.add_row("Interface", f"[bold]{iface}[/bold]  IP: {ip}  CIDR: {cidr}  MAC: {mac}")
+            t.add_row("Interface",
+                      f"[bold]{iface}[/bold]  IP: {ip}  CIDR: {cidr}  MAC: {mac}")
         if gateway:
             t.add_row("Gateway", f"[bold]{gateway}[/bold]")
         console.print(Panel(t, title="[bold purple]Local Network[/bold purple]",
@@ -722,265 +1067,370 @@ def print_local_info(ifaces, gateway):
     else:
         for (iface, ip, nm, mac) in ifaces:
             cidr = iface_to_cidr(ip, nm)
-            print(f"{C['purple']}Interface:{C['reset']} {iface}  IP: {ip}  CIDR: {cidr}  MAC: {mac}")
+            print(f"{C['purple']}Interface:{C['reset']} {iface}  "
+                  f"IP: {ip}  CIDR: {cidr}  MAC: {mac}")
         if gateway:
             print(f"{C['purple']}Gateway:{C['reset']} {gateway}")
 
 
-def build_table(devices: list[dict], do_ports: bool = False) -> "Table":
+def build_rich_table(entries: list, do_ports=False) -> "Table":
     t = Table(
-        title=f"[bold purple]Discovered Devices — {datetime.now().strftime('%H:%M:%S')}[/bold purple]",
-        box=box.HEAVY_HEAD,
-        border_style="purple",
-        header_style="bold magenta",
-        show_lines=True,
-        padding=(0, 1),
+        title=f"[bold purple]Discovered Devices — "
+              f"{datetime.now().strftime('%H:%M:%S')}[/bold purple]",
+        box=box.HEAVY_HEAD, border_style="purple",
+        header_style="bold magenta", show_lines=True, padding=(0, 1),
     )
-    t.add_column("#",        style="dim",          width=4, justify="right")
-    t.add_column("IP Address", style="bold cyan",  width=16)
+    t.add_column("#",           style="dim",       width=4,  justify="right")
+    t.add_column("IP Address",  style="bold cyan", width=16)
     t.add_column("MAC Address", style="yellow",    width=19)
-    t.add_column("Vendor",    style="green",        width=22)
-    t.add_column("Hostname",  style="white",        width=28)
+    t.add_column("Vendor",      style="green",     width=24)
+    t.add_column("Hostname",    style="white",     width=26)
+    t.add_column("Count",       style="dim",       width=6,  justify="right")
     if do_ports:
-        t.add_column("Open Ports", style="red",    width=30)
-
-    for idx, dev in enumerate(devices, 1):
-        ports_str = ", ".join(map(str, dev.get("ports", []))) or "—"
-        row = [
-            str(idx),
-            dev["ip"],
-            dev["mac"],
-            dev.get("vendor", "Unknown") or "Unknown",
-            dev.get("hostname", "") or "—",
-        ]
+        t.add_column("Open Ports", style="red",    width=28)
+    for idx, e in enumerate(entries, 1):
+        row = [str(idx), e.ip, e.mac,
+               e.vendor or "Unknown vendor",
+               e.hostname or "—",
+               str(e.count)]
         if do_ports:
-            row.append(ports_str)
+            ports = tcp_scan_host(e.ip)
+            row.append(", ".join(map(str, ports)) or "—")
         t.add_row(*row)
     return t
 
 
-def print_results(devices: list[dict], do_ports: bool = False):
-    if not devices:
-        if HAS_RICH:
-            console.print("[bold red][!] No devices found.[/bold red]")
-        else:
-            print(f"{C['red']}[!] No devices found.{C['reset']}")
+def print_rich_results(entries: list, do_ports=False):
+    if not entries:
+        _print_err("No devices found.")
         return
     if HAS_RICH:
-        console.print(build_table(devices, do_ports))
-        console.print(f"[dim purple]  Total: [bold]{len(devices)}[/bold] device(s) found[/dim purple]\n")
+        console.print(build_rich_table(entries, do_ports))
+        console.print(
+            f"[dim purple]  Total: [bold]{len(entries)}[/bold] "
+            f"device(s) found[/dim purple]\n")
     else:
-        # Plain fallback
-        header = f"{'#':>3}  {'IP':<16}  {'MAC':<18}  {'Vendor':<22}  {'Hostname'}"
-        print(f"{C['purple']}{header}{C['reset']}")
+        print(f"\n{'#':>3}  {'IP':<16}  {'MAC':<18}  {'Vendor':<24}  Hostname")
         print("-" * 80)
-        for i, dev in enumerate(devices, 1):
-            print(f"{i:>3}  {dev['ip']:<16}  {dev['mac']:<18}  "
-                  f"{dev.get('vendor','?'):<22}  {dev.get('hostname','')}")
-        print(f"\nTotal: {len(devices)} device(s)")
+        for i, e in enumerate(entries, 1):
+            print(f"{i:>3}  {e.ip:<16}  {e.mac:<18}  "
+                  f"{e.vendor:<24}  {e.hostname}")
+        print(f"\nTotal: {len(entries)} device(s)")
 
+# =============================================================================
+# LIVE MONITOR  (NetRecon feature)
+# =============================================================================
 
-def export_json(devices: list[dict], path: str):
-    data = {
-        "scan_time": datetime.now().isoformat(),
-        "total": len(devices),
-        "devices": devices,
-    }
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    _print_ok(f"JSON saved → {path}")
-
-
-def export_csv(devices: list[dict], path: str):
-    fields = ["ip", "mac", "vendor", "hostname"]
-    if devices and "ports" in devices[0]:
-        fields.append("ports")
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        for dev in devices:
-            row = dict(dev)
-            if "ports" in row:
-                row["ports"] = ",".join(map(str, row["ports"]))
-            w.writerow(row)
-    _print_ok(f"CSV saved → {path}")
-
-
-def _print_ok(msg):
+def live_monitor(cidr: str, iface: str, interval: int, do_ports: bool):
     if HAS_RICH:
-        console.print(f"[bold green][✓][/bold green] {msg}")
+        console.print(
+            f"\n[bold purple][~][/bold purple] Live monitor  "
+            f"(interval={interval}s) — Ctrl+C to stop\n")
     else:
-        print(f"{C['green']}[✓]{C['reset']} {msg}")
+        print(f"[~] Live monitor — {interval}s interval. Ctrl+C to stop.")
 
-def live_monitor(cidr: str, iface: str, interval: int = 15, do_ports: bool = False):
-  
-    if HAS_RICH:
-        console.print(f"\n[bold purple][~][/bold purple] Live monitor started  "
-                      f"(interval={interval}s)  — Ctrl+C to stop\n")
-    else:
-        print(f"[~] Live monitor — interval {interval}s. Ctrl+C to stop.")
-
-    known: dict[str, dict] = {}  # ip → device
-
+    known: dict = {}
     try:
         while True:
-            raw = scan_network(cidr, iface)
-            enriched = enrich_all(raw, do_ports)
-            current_ips = {d["ip"] for d in enriched}
+            fast_arp_scan(cidr, iface)
+            current = {e.ip: e for e in data_unique.snapshot()}
 
-            for dev in enriched:
-                ip = dev["ip"]
+            for ip, dev in current.items():
                 if ip not in known:
                     ts = datetime.now().strftime("%H:%M:%S")
+                    ports_str = ""
+                    if do_ports:
+                        p = tcp_scan_host(ip)
+                        ports_str = f"  ports: {p}" if p else ""
                     if HAS_RICH:
-                        console.print(f"[bold green][+][/bold green] [{ts}] NEW   "
-                                      f"{ip:<16}  {dev['mac']}  {dev.get('vendor','?')}")
+                        console.print(
+                            f"[bold green][+][/bold green] [{ts}] NEW   "
+                            f"{ip:<16}  {dev.mac}  {dev.vendor}{ports_str}")
                     else:
-                        print(f"[+] [{ts}] NEW   {ip}  {dev['mac']}")
+                        print(f"[+] [{ts}] NEW   {ip}  {dev.mac}{ports_str}")
                     known[ip] = dev
 
-            for ip in list(known.keys()):
-                if ip not in current_ips:
+            for ip in list(known):
+                if ip not in current:
                     ts = datetime.now().strftime("%H:%M:%S")
                     if HAS_RICH:
-                        console.print(f"[bold red][-][/bold red] [{ts}] LEFT  {ip:<16}  "
-                                      f"{known[ip]['mac']}  {known[ip].get('vendor','?')}")
+                        console.print(
+                            f"[bold red][-][/bold red] [{ts}] LEFT  "
+                            f"{ip:<16}  {known[ip].mac}  {known[ip].vendor}")
                     else:
-                        print(f"[-] [{ts}] LEFT  {ip}  {known[ip]['mac']}")
+                        print(f"[-] [{ts}] LEFT  {ip}  {known[ip].mac}")
                     del known[ip]
 
+            data_unique.clear()
+            data_reply.clear()
+            data_request.clear()
             time.sleep(interval)
     except KeyboardInterrupt:
         if HAS_RICH:
             console.print("\n[dim purple]Live monitor stopped.[/dim purple]")
 
+# =============================================================================
+# CLI ARGUMENT PARSER
+# =============================================================================
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="netrecon",
-        description="Autonomous local network scanner — zero config ARP discovery",
+        description=f"NetRecon v{VERSION} — Autonomous local network scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sudo python3 netrecon.py
-  sudo python3 netrecon.py --live
-  sudo python3 netrecon.py --ports --json results.json
-  sudo python3 netrecon.py --csv scan.csv --verbose
+  sudo python3 netrecon.py                          # auto-scan + TUI
+  sudo python3 netrecon.py -r 192.168.1.0/24        # specific range + TUI
+  sudo python3 netrecon.py -p                        # passive mode + TUI
+  sudo python3 netrecon.py -r 192.168.1.0/24 -P     # parsable output
+  sudo python3 netrecon.py -L                        # parsable + keep listening
+  sudo python3 netrecon.py --live                    # live monitor (rich)
+  sudo python3 netrecon.py --ports --json out.json   # port scan + export
+  sudo python3 netrecon.py -f                        # fast mode
+  sudo python3 netrecon.py -m known_hosts.txt        # highlight known MACs
         """
     )
-    p.add_argument("--live",    action="store_true", help="Live monitor mode (detect join/leave)")
-    p.add_argument("--interval",type=int, default=15, metavar="SEC",
+    # netdiscover-compatible flags
+    p.add_argument("-i", "--iface",    metavar="IFACE",
+                   help="Network interface (auto-detect if not set)")
+    p.add_argument("-r", "--range",    metavar="CIDR",
+                   help="Scan a specific CIDR range")
+    p.add_argument("-l", "--list",     metavar="FILE",
+                   help="File with CIDRs to scan (one per line)")
+    p.add_argument("-p", "--passive",  action="store_true",
+                   help="Passive mode — sniff only, no injection")
+    p.add_argument("-m", "--macs",     metavar="FILE",
+                   help="Known MACs file for host labeling")
+    p.add_argument("-F", "--filter",   default="arp", metavar="EXPR",
+                   help="Custom pcap filter (default: 'arp')")
+    p.add_argument("-f", "--fast",     action="store_true",
+                   help="Fast mode — probe only common last octets")
+    p.add_argument("-c", "--count",    type=int, default=1, metavar="N",
+                   help="Repeat each ARP request N times (default: 1)")
+    p.add_argument("-s", "--sleep",    type=int, default=0, metavar="MS",
+                   help="Sleep between ARP requests in ms")
+    p.add_argument("-S", "--suppress", action="store_true",
+                   help="Suppress per-packet sleep (hardcore mode)")
+    p.add_argument("-n", "--node",     type=int, default=67, metavar="OCTET",
+                   help="Source IP last octet (2-253, default: 67)")
+    p.add_argument("-P", "--parsable", action="store_true",
+                   help="Parsable output, stop after active scan")
+    p.add_argument("-L", "--listen",   action="store_true",
+                   help="Parsable output, keep listening after scan")
+    p.add_argument("-N", "--no-header",action="store_true",
+                   help="No header in parsable output")
+    p.add_argument("-R", "--no-root",  action="store_true",
+                   help="Skip root check")
+    # NetRecon extras
+    p.add_argument("--live",     action="store_true",
+                   help="Live monitor — detect devices joining/leaving")
+    p.add_argument("--interval", type=int, default=15, metavar="SEC",
                    help="Live mode rescan interval (default: 15s)")
-    p.add_argument("--json",    metavar="FILE", help="Export results to JSON file")
-    p.add_argument("--csv",     metavar="FILE", help="Export results to CSV file")
-    p.add_argument("--ports",   action="store_true", help="Enable port scan on discovered hosts")
-    p.add_argument("--verbose", action="store_true", help="Show debug/verbose output")
-    p.add_argument("--timeout", type=float, default=2.0, metavar="SEC",
+    p.add_argument("--ports",    action="store_true",
+                   help="TCP port scan on discovered hosts")
+    p.add_argument("--json",     metavar="FILE", help="Export to JSON")
+    p.add_argument("--csv",      metavar="FILE", help="Export to CSV")
+    p.add_argument("--verbose",  action="store_true", help="Verbose output")
+    p.add_argument("--timeout",  type=float, default=2.0, metavar="SEC",
                    help="ARP scan timeout (default: 2.0s)")
-    p.add_argument("--iface",   metavar="IFACE", help="Force specific interface (auto-detect by default)")
     return p
 
+# =============================================================================
+# MAIN
+# =============================================================================
 
-def check_root():
+def check_root(skip=False):
+    if skip:
+        return
     if os.geteuid() != 0:
-        print_err("netrecon requires root privileges. Run: sudo python3 netrecon.py")
+        _print_err("netrecon requires root. Run: sudo python3 netrecon.py")
         sys.exit(1)
 
 
 def check_deps():
     if MISSING:
         for dep in MISSING:
-            print_err(f"Missing dependency: {dep}  →  pip install {dep}")
+            _print_err(f"Missing: {dep}  →  pip install {dep}")
         if not HAS_SCAPY:
-            print_err("Scapy is required for ARP scanning. Install it first.")
+            _print_err("Scapy is required for ARP scanning.")
             sys.exit(1)
 
 
-def resolve_forced_iface(iface_name: str) -> tuple[str, str, str, str]:
-    """
-    User passed --iface IFACE_NAME. Resolve its IP/netmask/MAC from the OS.
-    Does NOT require the interface to be the default-route interface.
-    """
-    all_ifaces = detect_all_interfaces()
-    for rec in all_ifaces:
-        if rec[0] == iface_name:
-            return rec
-    print_err(f"Interface '{iface_name}' not found or has no IPv4 address.")
-    sys.exit(1)
-
-
-def run_scan(cidr: str, iface_name: str, args) -> list[dict]:
-    t0 = time.time()
-    devices = []
-    net = ipaddress.IPv4Network(cidr, strict=False)
-    host_count = net.num_addresses - 2
-
-    if HAS_RICH:
-        with Progress(
-            SpinnerColumn(spinner_name="aesthetic", style="bold purple"),
-            TextColumn("[bold purple]{task.description}"),
-            BarColumn(bar_width=28, style="purple", complete_style="bright_magenta"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True,
-        ) as prog:
-            task = prog.add_task(
-                f"[ARP] {cidr}  ({host_count} hosts)", total=None
-            )
-            raw = scan_network(cidr, iface_name, args.verbose)
-            prog.update(task, description=f"[ENRICH] {len(raw)} host(s) found ...")
-            devices = enrich_all(raw, args.ports)
-    else:
-        print(f"[*] Scanning {cidr}  ({host_count} hosts) ...")
-        raw = scan_network(cidr, iface_name, args.verbose)
-        print(f"[*] Enriching {len(raw)} host(s) ...")
-        devices = enrich_all(raw, args.ports)
-
-    elapsed = time.time() - t0
-    if HAS_RICH:
-        console.print(
-            f"  [dim purple]Scan complete in [bold]{elapsed:.1f}s[/bold]  —  "
-            f"[bold]{len(devices)}[/bold] device(s) found[/dim purple]\n")
-    else:
-        print(f"[✓] Done in {elapsed:.1f}s — {len(devices)} device(s)")
-    return devices
-
-
 def main():
+    global _parsable_output, _continue_listening, _no_header
+
     parser = build_parser()
     args   = parser.parse_args()
 
-    print_banner()
-    check_root()
+    _parsable_output    = args.parsable or args.listen
+    _continue_listening = args.listen
+    _no_header          = args.no_header
+
+    if not _parsable_output:
+        print_banner()
+
+    check_root(skip=args.no_root)
     check_deps()
 
+    # Load known MACs
+    if args.macs:
+        if not load_known_mac_table(args.macs):
+            _print_err(f"Cannot read MACs file: {args.macs}")
+
+    # Resolve interface
     if args.iface:
         chosen = resolve_forced_iface(args.iface)
     else:
         chosen = detect_active_interface()
         if not chosen:
-            print_err(
-                "Could not auto-detect an active network interface.\n"
-                "  Try: sudo python3 netrecon.py --iface eth0"
-            )
+            _print_err("Could not auto-detect interface. Use: -i eth0")
             sys.exit(1)
 
     iface_name, ip, nm, mac = chosen
     cidr    = iface_to_cidr(ip, nm)
     gateway = detect_gateway()
 
-    print_local_info([chosen], gateway)
-  
+    inject_init(iface_name)
+
+    if not _parsable_output:
+        print_local_info([chosen], gateway)
+
+    # Parsable header
+    if _parsable_output and not _no_header:
+        print_parsable_header()
+
+    stop_event = threading.Event()
+
+    # ── Signal handler ────────────────────────────────────────────────────────
+    def _sigint(sig, frame):
+        stop_event.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    # ── Determine ranges to scan ──────────────────────────────────────────────
+    if args.list:
+        try:
+            with open(args.list) as f:
+                scan_ranges = [l.strip() for l in f if l.strip()]
+        except Exception:
+            _print_err(f"Cannot read list file: {args.list}")
+            sys.exit(1)
+    elif args.range:
+        scan_ranges = [args.range]
+    elif args.passive:
+        scan_ranges = []
+    elif args.live:
+        scan_ranges = [cidr]
+    else:
+        scan_ranges = COMMON_NETWORKS   # auto-scan
+
+    # ── LIVE MONITOR MODE ─────────────────────────────────────────────────────
     if args.live:
         live_monitor(cidr, iface_name, args.interval, args.ports)
         return
 
-    devices = run_scan(cidr, iface_name, args)
-    print_results(devices, args.ports)
+    # ── PASSIVE MODE ──────────────────────────────────────────────────────────
+    if args.passive:
+        _current_net[0] = "(passive)"
+        if _parsable_output:
+            # Just sniff and print — no TUI
+            sniff_t = threading.Thread(
+                target=start_sniffer,
+                args=(iface_name, args.filter, stop_event),
+                daemon=True)
+            sniff_t.start()
+            try:
+                sniff_t.join()
+            except KeyboardInterrupt:
+                stop_event.set()
+        else:
+            # TUI + passive sniff
+            sniff_t = threading.Thread(
+                target=start_sniffer,
+                args=(iface_name, args.filter, stop_event),
+                daemon=True)
+            sniff_t.start()
+            try:
+                curses.wrapper(run_tui, stop_event)
+            finally:
+                stop_event.set()
+        entries = data_unique.snapshot()
+        if not _parsable_output:
+            print_rich_results(entries, args.ports)
+        _finalize(entries, args, stop_event)
+        return
 
+    # ── ACTIVE MODE ───────────────────────────────────────────────────────────
+    # Start sniffer thread first (always running)
+    sniff_t = threading.Thread(
+        target=start_sniffer,
+        args=(iface_name, args.filter, stop_event),
+        daemon=True)
+    sniff_t.start()
+
+    # Injection thread
+    def _inject_thread():
+        time.sleep(2)   # let sniffer settle
+        for r in scan_ranges:
+            if stop_event.is_set():
+                break
+            _vprint(args.verbose, f"[*] Injecting: {r}")
+            inject_range(
+                cidr          = r,
+                iface         = iface_name,
+                src_node      = args.node,
+                repeat        = args.count,
+                sleep_ms      = args.sleep,
+                suppress_sleep= args.suppress,
+                fast_mode     = args.fast,
+                stop_event    = stop_event,
+                current_network_ref = _current_net,
+            )
+        time.sleep(2)
+        _current_net[0] = "Finished!"
+        _scan_finished[0] = True
+
+        if _parsable_output:
+            entries = data_unique.snapshot()
+            print(f"\n-- Active scan completed, {len(entries)} Hosts found.")
+            if not _continue_listening:
+                stop_event.set()
+            else:
+                print(" Continuing to listen passively.\n")
+
+    inject_t = threading.Thread(target=_inject_thread, daemon=True)
+    inject_t.start()
+
+    if _parsable_output:
+        # No TUI — wait for injection to finish
+        try:
+            inject_t.join()
+            if _continue_listening:
+                sniff_t.join()
+        except KeyboardInterrupt:
+            stop_event.set()
+    else:
+        # Launch TUI
+        try:
+            curses.wrapper(run_tui, stop_event)
+        finally:
+            stop_event.set()
+
+    inject_t.join(timeout=3)
+
+    entries = data_unique.snapshot()
+    if not _parsable_output:
+        print_rich_results(entries, args.ports)
+
+    _finalize(entries, args, stop_event)
+
+
+def _finalize(entries: list, args, stop_event: threading.Event):
+    """Export and cleanup after scan."""
     if args.json:
-        export_json(devices, args.json)
+        export_json(entries, args.json)
     if args.csv:
-        export_csv(devices, args.csv)
+        export_csv(entries, args.csv)
 
 
 if __name__ == "__main__":
