@@ -63,8 +63,8 @@ sudo netreconx -i wlan0 -r 192.168.0.0/24
 Clone the repository:
 
 ```bash
-git clone https://github.com/xploitoverload/NetRecon.git
-cd NetRecon
+git clone https://github.com/xploitoverload/NetReconX.git
+cd NetReconX
 ```
 
 Create and activate a virtual environment:
