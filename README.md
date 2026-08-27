@@ -13,7 +13,7 @@ Built for **visibility, control, and straightforward network reconnaissance**.
 ### Operator
 
 * **Kalpesh Solanki**
-* Contact: [xploitoverload@github.com](mailto:hello@cx330.in)
+* Contact: [hello@cx330.in](mailto:hello@cx330.in)
 ---
 
 <p align="center">
